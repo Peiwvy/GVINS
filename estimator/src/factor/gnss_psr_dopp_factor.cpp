@@ -1,13 +1,23 @@
 #include "gnss_psr_dopp_factor.hpp"
 
+/**
+ * @brief Construct a new Gnss Psr Dopp Factor:: Gnss Psr Dopp Factor object
+ *    后端优化的伪距和多普勒频移因子
+ * @param[in] _obs 卫星观测信息
+ * @param[in] _ephem  卫星星历信息
+ * @param[in] _iono_paras  接受到的最新的电离层延时数据，一定是8个数
+ * @param[in] _ratio  当前这个卫星观测到在相邻两个图像帧之间的总时间之间，占的后半部分的时间比例
+ */
 GnssPsrDoppFactor::GnssPsrDoppFactor(const ObsPtr &_obs, const EphemBasePtr &_ephem, 
     std::vector<double> &_iono_paras, const double _ratio) 
         : obs(_obs), ephem(_ephem), iono_paras(_iono_paras), ratio(_ratio)
 {
+    //; 首先还是判断是不是L1频段的卫星观测信息
     freq = L1_freq(obs, &freq_idx);
     LOG_IF(FATAL, freq < 0) << "No L1 observation found.";
 
-    uint32_t sys = satsys(obs->sat, NULL);
+    uint32_t sys = satsys(obs->sat, NULL);   // 哪个卫星系统
+    //time of flight
     double tof = obs->psr[freq_idx] / LIGHT_SPEED;
     gtime_t sv_tx = time_add(obs->time, -tof);
 
@@ -19,14 +29,17 @@ GnssPsrDoppFactor::GnssPsrDoppFactor(const ObsPtr &_obs, const EphemBasePtr &_ep
         sv_pos = geph2pos(sv_tx, glo_ephem, &svdt);
         sv_vel = geph2vel(sv_tx, glo_ephem, &svddt);
         tgd = 0.0;
+        //obs->psr_std 伪码标准差
         pr_uura = 2.0 * (obs->psr_std[freq_idx]/0.16);
+        //多普勒标准差
         dp_uura = 2.0 * (obs->dopp_std[freq_idx]/0.256);
     }
     else
     {
         EphemPtr eph = std::dynamic_pointer_cast<Ephem>(ephem);
-        svdt = eph2svdt(sv_tx, eph);
+        svdt = eph2svdt (sv_tx, eph);
         sv_tx = time_add(sv_tx, -svdt);
+        //根据广播星历计算出算信号发射时刻卫星的 P、V、C
         sv_pos = eph2pos(sv_tx, eph, &svdt);
         sv_vel = eph2vel(sv_tx, eph, &svddt);
         tgd = eph->tgd[0];
@@ -63,43 +76,53 @@ bool GnssPsrDoppFactor::Evaluate(double const *const *parameters, double *residu
 
     double sin_yaw_diff = std::sin(yaw_diff);
     double cos_yaw_diff = std::cos(yaw_diff);
+    //yaw角，Rwn
     Eigen::Matrix3d R_enu_local;
     R_enu_local << cos_yaw_diff, -sin_yaw_diff, 0,
                    sin_yaw_diff,  cos_yaw_diff, 0,
                    0           ,  0           , 1;
+    //local-enu-ecef
     Eigen::Matrix3d R_ecef_enu = ecef2rotation(ref_ecef);
     Eigen::Matrix3d R_ecef_local = R_ecef_enu * R_enu_local;
-
+    //计算卫星在ECEF坐标系下坐标(文章公式14)
     Eigen::Vector3d P_ecef = R_ecef_local * local_pos + ref_ecef;
     Eigen::Vector3d V_ecef = R_ecef_local * local_vel;
 
     double ion_delay = 0, tro_delay = 0;
     double azel[2] = {0, M_PI/2.0};
+    //计算对流层和电离层误差
     if (P_ecef.norm() > 0)
     {
-        sat_azel(P_ecef, sv_pos, azel);
+        //卫星方位角
+        sat_azel(P_ecef, sv_pos, azel);//(计算卫星方位角/仰角)
         Eigen::Vector3d rcv_lla = ecef2geo(P_ecef);
         tro_delay = calculate_trop_delay(obs->time, rcv_lla, azel);
         ion_delay = calculate_ion_delay(obs->time, iono_paras, rcv_lla, azel);
     }
     double sin_el = sin(azel[1]);
     double sin_el_2 = sin_el*sin_el;
+    //设置权重，（pr_uura和标准差相关） （？）
     double pr_weight = sin_el_2 / pr_uura * relative_sqrt_info;
     double dp_weight = sin_el_2 / dp_uura * relative_sqrt_info * PSR_TO_DOPP_RATIO;
 
     Eigen::Vector3d rcv2sat_ecef = sv_pos - P_ecef;
     Eigen::Vector3d rcv2sat_unit = rcv2sat_ecef.normalized();
 
+    //EARTH_OMG_GPS(地球自转角速度) sagnac效应
     const double psr_sagnac = EARTH_OMG_GPS*(sv_pos(0)*P_ecef(1)-sv_pos(1)*P_ecef(0))/LIGHT_SPEED;
+        //公式2
     double psr_estimated = rcv2sat_ecef.norm() + psr_sagnac + rcv_dt - svdt*LIGHT_SPEED + 
                                 ion_delay + tro_delay + tgd*LIGHT_SPEED;
-    
+
     residuals[0] = (psr_estimated - obs->psr[freq_idx]) * pr_weight;
+
+
 
     const double dopp_sagnac = EARTH_OMG_GPS/LIGHT_SPEED*(sv_vel(0)*P_ecef(1)+
             sv_pos(0)*V_ecef(1) - sv_vel(1)*P_ecef(0) - sv_pos(1)*V_ecef(0));
     double dopp_estimated = (sv_vel - V_ecef).dot(rcv2sat_unit) + dopp_sagnac + rcv_ddt - svddt*LIGHT_SPEED;
     const double wavelength = LIGHT_SPEED / freq;
+    //公式21
     residuals[1] = (dopp_estimated + obs->dopp[freq_idx]*wavelength) * dp_weight;
 
     if (jacobians)
@@ -112,7 +135,7 @@ bool GnssPsrDoppFactor::Evaluate(double const *const *parameters, double *residu
             J_Pi.topLeftCorner<1, 3>() = -rcv2sat_unit.transpose() * R_ecef_local * pr_weight * ratio;
 
             const double norm3 = pow(rcv2sat_ecef.norm(), 3);
-            const double norm2 = rcv2sat_ecef.squaredNorm();
+            const double norm2 = rcv2sat_ecef.squaredNorm(); //平方
             Eigen::Matrix3d unit2rcv_pos;
             for (size_t i = 0; i < 3; ++i)
             {

@@ -112,11 +112,11 @@ class Estimator
     Eigen::Vector3d anc_ecef;
     Eigen::Matrix3d R_ecef_enu;
     double yaw_enu_local;
-    std::vector<ObsPtr> gnss_meas_buf[(WINDOW_SIZE+1)];   // 过滤之后的观测信息
-    std::vector<EphemBasePtr> gnss_ephem_buf[(WINDOW_SIZE+1)];  // 过滤之后的星历信息
-    std::vector<double> latest_gnss_iono_params;   // 电离层参数，必须是8个数
+    std::vector<ObsPtr> gnss_meas_buf[(WINDOW_SIZE+1)]; // 过滤之后的观测信息
+    std::vector<EphemBasePtr> gnss_ephem_buf[(WINDOW_SIZE+1)]; // 过滤之后的星历信息
+    std::vector<double> latest_gnss_iono_params;  // 电离层参数，必须是8个数
 
-    //; 注意下面存储的键都是以卫星编号作为索引的，也就是同一个卫星的所有的观测信息，都是存在一个数组中的
+    // 注意下面存储的键都是以卫星编号作为索引的，也就是同一个卫星的所有的观测信息，都是存在一个数组中的
     std::map<uint32_t, std::vector<EphemBasePtr>> sat2ephem;  // 《卫星编号，<星历信息>》
     std::map<uint32_t, std::map<double, size_t>> sat2time_index;  // 《卫星编号，<卫星时间，存储的这个卫星的所有观测的个数》
     std::map<uint32_t, uint32_t> sat_track_status;

@@ -12,7 +12,7 @@ using namespace Eigen;
 using namespace std;
 
 
-
+// 算法中的3d点，以及能观测到他的图像帧对应的2D点合集
 struct SFMFeature
 {
     bool state;
@@ -32,6 +32,7 @@ struct ReprojectionError3D
 	bool operator()(const T* const camera_R, const T* const camera_T, const T* point, T* residuals) const
 	{
 		T p[3];
+		// 从point转换到p，即从地图点到相机坐标系
 		ceres::QuaternionRotatePoint(camera_R, point, p);
 		p[0] += camera_T[0]; p[1] += camera_T[1]; p[2] += camera_T[2];
 		T xp = p[0] / p[2];
@@ -41,11 +42,12 @@ struct ReprojectionError3D
     	return true;
 	}
 
+	// 利用ceres计算导数
 	static ceres::CostFunction* Create(const double observed_x,
 	                                   const double observed_y) 
 	{
 	  return (new ceres::AutoDiffCostFunction<
-	          ReprojectionError3D, 2, 4, 3, 3>(
+	          ReprojectionError3D, 2, 4, 3, 3>( // 2：残差维度，4:相机旋转四元数维度，3:相机位置维度，3：3D点维度
 	          	new ReprojectionError3D(observed_x,observed_y)));
 	}
 

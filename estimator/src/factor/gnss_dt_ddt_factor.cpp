@@ -10,6 +10,7 @@ bool DtDdtFactor::Evaluate(double const *const *parameters, double *residuals, d
     double rev_ddt_j = parameters[3][0];
 
     double average_ddt = 0.5 * (rev_ddt_i + rev_ddt_j);
+    //; dt_info_coeff是这个残差的信息矩阵，表示权重
     residuals[0] = (rev_dt_j - rev_dt_i - average_ddt * delta_t) * dt_info_coeff;
 
     if (jacobians)

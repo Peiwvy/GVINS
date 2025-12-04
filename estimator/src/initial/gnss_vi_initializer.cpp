@@ -13,6 +13,14 @@ GNSSVIInitializer::GNSSVIInitializer(const std::vector<std::vector<ObsPtr>> &gns
     }
 }
 
+
+/**
+ * @brief 调用了gnss_comm中的spp算法计算大概的位置
+ * 
+ * @param result 输出值xyzt，7*1矩阵
+ * @return true 
+ * @return false 
+ */
 bool GNSSVIInitializer::coarse_localization(Eigen::Matrix<double, 7, 1> &result)
 {
     result.setZero();
@@ -20,6 +28,7 @@ bool GNSSVIInitializer::coarse_localization(Eigen::Matrix<double, 7, 1> &result)
     std::vector<EphemBasePtr> accum_ephems;
     for (uint32_t i = 0; i < gnss_meas_buf.size(); ++i)
     {
+        // 将复制数据并尾插到accum_obs和accum_ephems
         std::copy(gnss_meas_buf[i].begin(), gnss_meas_buf[i].end(), std::back_inserter(accum_obs));
         std::copy(gnss_ephem_buf[i].begin(), gnss_ephem_buf[i].end(), std::back_inserter(accum_ephems));
     }
@@ -40,6 +49,17 @@ bool GNSSVIInitializer::coarse_localization(Eigen::Matrix<double, 7, 1> &result)
     return true;
 }
 
+
+/**
+ * @brief 对速度建立约束，通过优化迭代的方法优化yaw角以及时漂
+ * 
+ * @param local_vs 
+ * @param rough_anchor_ecef 
+ * @param aligned_yaw 
+ * @param rcv_ddt 
+ * @return true 
+ * @return false 
+ */
 bool GNSSVIInitializer::yaw_alignment(const std::vector<Eigen::Vector3d> &local_vs, 
     const Eigen::Vector3d &rough_anchor_ecef, double &aligned_yaw, double &rcv_ddt)
 {
@@ -59,8 +79,9 @@ bool GNSSVIInitializer::yaw_alignment(const std::vector<Eigen::Vector3d> &local_
         align_G.col(1).setOnes();
         Eigen::VectorXd align_b(num_all_meas);
         align_b.setZero();
-        Eigen::Matrix3d align_R_enu_local(Eigen::AngleAxisd(est_yaw, Eigen::Vector3d::UnitZ()));
+        Eigen::Matrix3d align_R_enu_local(Eigen::AngleAxisd(est_yaw, Eigen::Vector3d::UnitZ()));// 绕Z轴旋转est_yaw角
         Eigen::Matrix3d align_tmp_M;
+        // 该矩阵为Rz的倒数
         align_tmp_M << -sin(est_yaw), -cos(est_yaw), 0,
                         cos(est_yaw), -sin(est_yaw), 0,
                         0       , 0        , 0;
@@ -68,7 +89,7 @@ bool GNSSVIInitializer::yaw_alignment(const std::vector<Eigen::Vector3d> &local_
         uint32_t align_counter = 0;
         for (uint32_t i = 0; i < gnss_meas_buf.size(); ++i)
         {
-            Eigen::Matrix<double, 4, 1> ecef_vel_ddt;
+            Eigen::Matrix<double, 4, 1> ecef_vel_ddt; // 估计量速度，时漂，与ECEF对齐
             ecef_vel_ddt.head<3>() = rough_R_ecef_enu * align_R_enu_local * local_vs[i];
             ecef_vel_ddt(3) = est_rcv_ddt;
             Eigen::VectorXd epoch_res;
@@ -76,7 +97,7 @@ bool GNSSVIInitializer::yaw_alignment(const std::vector<Eigen::Vector3d> &local_
             dopp_res(ecef_vel_ddt, rough_anchor_ecef, gnss_meas_buf[i], all_sat_states[i], epoch_res, epoch_J);
             align_b.segment(align_counter, gnss_meas_buf[i].size()) = epoch_res;
             align_G.block(align_counter, 0, gnss_meas_buf[i].size(), 1) = 
-                epoch_J.leftCols(3)*rough_R_ecef_enu*align_tmp_M*local_vs[i];
+                epoch_J.leftCols(3)*rough_R_ecef_enu*align_tmp_M*local_vs[i]; // (1*3)*(3*3)*(3*3)*(3*1)
             align_counter += gnss_meas_buf[i].size();
         }
         Eigen::VectorXd dx = -(align_G.transpose()*align_G).inverse() * align_G.transpose() * align_b;
@@ -92,7 +113,7 @@ bool GNSSVIInitializer::yaw_alignment(const std::vector<Eigen::Vector3d> &local_
         return false;
     }
 
-    aligned_yaw = est_yaw;
+    aligned_yaw = est_yaw;// 将估计的yaw调整到-2pi到2pi之间
     if (aligned_yaw > M_PI)
         aligned_yaw -= floor(est_yaw/(2.0*M_PI) + 0.5) * (2.0*M_PI);
     else if (aligned_yaw < -M_PI)
@@ -103,6 +124,18 @@ bool GNSSVIInitializer::yaw_alignment(const std::vector<Eigen::Vector3d> &local_
     return true;
 }
 
+
+/**
+ * @brief 使用码伪距对锚点和时偏建立约束，细化锚点
+ * 
+ * @param local_ps 
+ * @param aligned_yaw 
+ * @param aligned_ddt 
+ * @param rough_ecef_dt 
+ * @param refined_ecef_dt 
+ * @return true 
+ * @return false 
+ */
 bool GNSSVIInitializer::anchor_refinement(const std::vector<Eigen::Vector3d> &local_ps, 
     const double aligned_yaw, const double aligned_ddt, 
     const Eigen::Matrix<double, 7, 1> &rough_ecef_dt, Eigen::Matrix<double, 7, 1> &refined_ecef_dt)
@@ -136,7 +169,7 @@ bool GNSSVIInitializer::anchor_refinement(const std::vector<Eigen::Vector3d> &lo
         {
             Eigen::Matrix<double, 7, 1> ecef_xyz_dt;
             ecef_xyz_dt.head<3>() = refine_R_ecef_local * local_ps[i] + refine_anchor;
-            ecef_xyz_dt.tail<4>() = refine_dt + aligned_ddt * i * Eigen::Vector4d::Ones();
+            ecef_xyz_dt.tail<4>() = refine_dt + aligned_ddt * i * Eigen::Vector4d::Ones(); // 这里直接使接收时钟残差因子置为零，所以之后没有针对该因子进行优化
 
             Eigen::VectorXd epoch_res;
             Eigen::MatrixXd epoch_J;
@@ -147,7 +180,7 @@ bool GNSSVIInitializer::anchor_refinement(const std::vector<Eigen::Vector3d> &lo
             refine_G.middleRows(refine_counter, gnss_meas_buf[i].size()) = epoch_J;
             refine_counter += gnss_meas_buf[i].size();
         }
-        for (uint32_t k : unobserved_sys)
+        for (uint32_t k : unobserved_sys) // 这里将未观测到的卫星系统时间偏差置为0，不对其进行优化
         {
             refine_b(refine_counter) = 0;
             refine_G(refine_counter, k+3) = 1.0;

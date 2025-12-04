@@ -2,6 +2,7 @@
 
 bool PoseLocalParameterization::Plus(const double *x, const double *delta, double *x_plus_delta) const
 {
+    //转换成eigen 数据结构
     Eigen::Map<const Eigen::Vector3d> _p(x);
     Eigen::Map<const Eigen::Quaterniond> _q(x + 3);
 
