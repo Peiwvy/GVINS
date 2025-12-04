@@ -25,6 +25,14 @@ bool first_image_flag = true;
 double last_image_time = 0;
 bool init_pub = 0;
 
+/**
+ * @brief   图片的回调函数，ROS回调函数，对新来的图像进行特征点追踪，发布
+ * @Description readImage()函数对新来的图像使用光流法进行特征点跟踪
+ *              追踪的特征点封装成feature_points发布到pub_img的话题下，
+ *              图像封装成ptr发布在pub_match下
+ * @param[in]   img_msg 输入的图像
+ * @return      void
+*/
 void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
 {
     if(first_image_flag)
@@ -35,6 +43,7 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
         return;
     }
     // detect unstable camera stream
+    // 图像时间差太多光流追踪就会失败，这里没有描述子匹配，因此对时间戳要求就高
     if (img_msg->header.stamp.toSec() - last_image_time > 1.0 || img_msg->header.stamp.toSec() < last_image_time)
     {
         ROS_WARN("image discontinue! reset the feature tracker!");
@@ -51,7 +60,7 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
     if (round(1.0 * pub_count / (img_msg->header.stamp.toSec() - first_image_time)) <= FREQ)
     {
         PUB_THIS_FRAME = true;
-        // reset the frequency control
+        // reset the frequency control 控制一下发给后端的频率，并不是每读入一帧图像，就要发布特征点
         if (abs(1.0 * pub_count / (img_msg->header.stamp.toSec() - first_image_time) - FREQ) < 0.01 * FREQ)
         {
             first_image_time = img_msg->header.stamp.toSec();
@@ -62,6 +71,7 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
         PUB_THIS_FRAME = false;
 
     cv_bridge::CvImageConstPtr ptr;
+    //将图像编码8UC1转换为mono8
     if (img_msg->encoding == "8UC1")
     {
         sensor_msgs::Image img;
@@ -83,6 +93,7 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
     {
         ROS_DEBUG("processing camera %d", i);
         if (i != 1 || !STEREO_TRACK)
+            /*readImage()函数读取图像数据进行处理*/
             trackerData[i].readImage(ptr->image.rowRange(ROW * i, ROW * (i + 1)), img_msg->header.stamp.toSec());
         else
         {
@@ -93,7 +104,7 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
             }
             else
                 trackerData[i].cur_img = ptr->image.rowRange(ROW * i, ROW * (i + 1));
-        }
+    }
 
 #if SHOW_UNDISTORTION
         trackerData[i].showUndistortion("undistrotion_" + std::to_string(i));
@@ -110,8 +121,8 @@ void img_callback(const sensor_msgs::ImageConstPtr &img_msg)
             break;
     }
 
-   if (PUB_THIS_FRAME)
-   {
+    if (PUB_THIS_FRAME)
+    {
         pub_count++;
         sensor_msgs::PointCloudPtr feature_points(new sensor_msgs::PointCloud);
         sensor_msgs::ChannelFloat32 id_of_point;
@@ -230,6 +241,7 @@ int main(int argc, char **argv)
 
     ros::Subscriber sub_img = n.subscribe(IMAGE_TOPIC, 100, img_callback);
 
+    // 发布视觉特征点 
     pub_img = n.advertise<sensor_msgs::PointCloud>("feature", 1000);
     pub_match = n.advertise<sensor_msgs::Image>("feature_img",1000);
     pub_restart = n.advertise<std_msgs::Bool>("restart",1000);

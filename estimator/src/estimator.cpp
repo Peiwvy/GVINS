@@ -129,10 +129,14 @@ void Estimator::processIMU(double dt, const Vector3d &linear_acceleration, const
     gyr_0 = angular_velocity;
 }
 
+// 格式:
+// xyz_uv_velocity << x, y, z, p_u, p_v, velocity_x, velocity_y;
+// image[feature_id].emplace_back(camera_id,  xyz_uv_velocity);
 void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<double, 7, 1>>>> &image, const std_msgs::Header &header)
 {
     ROS_DEBUG("new image coming ------------------------------------------");
     ROS_DEBUG("Adding feature points %lu", image.size());
+    // Step 1. 根据当前帧状态，判断边缘化老帧还是次新帧
     if (f_manager.addFeatureCheckParallax(frame_count, image, td))
         marginalization_flag = MARGIN_OLD;
     else
@@ -141,14 +145,17 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
     ROS_DEBUG("this frame is--------------------%s", marginalization_flag ? "reject" : "accept");
     ROS_DEBUG("%s", marginalization_flag ? "Non-keyframe" : "Keyframe");
     ROS_DEBUG("Solving %d", frame_count);
-    ROS_DEBUG("number of feature: %d", f_manager.getFeatureCount());
+    ROS_DEBUG("number of feature: %d", f_manager.getFeatureCount());// 有效特征点数量
     Headers[frame_count] = header;
 
-    ImageFrame imageframe(image, header.stamp.toSec());
+    // 创建图像帧
+    ImageFrame imageframe(image, header.stamp.toSec()); 
     imageframe.pre_integration = tmp_pre_integration;
     all_image_frame.insert(make_pair(header.stamp.toSec(), imageframe));
     tmp_pre_integration = new IntegrationBase{acc_0, gyr_0, Bas[frame_count], Bgs[frame_count]};
 
+    // Step 2. 初始化
+    // 如果需要在线标定VI的外参，那么进行标定外参
     if(ESTIMATE_EXTRINSIC == 2)
     {
         ROS_INFO("calibrating extrinsic param, rotation movement is needed");
@@ -172,6 +179,7 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
         if (frame_count == WINDOW_SIZE)
         {
             bool result = false;
+            // 初始化
             if( ESTIMATE_EXTRINSIC != 2 && (header.stamp.toSec() - initial_timestamp) > 0.1)
             {
                 result = initialStructure();
@@ -180,10 +188,14 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
             if(result)
             {
                 solver_flag = NON_LINEAR;
+                //非线性优化求解VIO
                 solveOdometry();
+                //滑动窗口
                 slideWindow();
+                // 移动无效地图点
                 f_manager.removeFailures();
                 ROS_INFO("Initialization finish!");
+                // 保留信息
                 last_R = Rs[WINDOW_SIZE];
                 last_P = Ps[WINDOW_SIZE];
                 last_R0 = Rs[0];
@@ -229,22 +241,28 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
     }
 }
 
+// 存储星历信息到类成员变量中
 void Estimator::inputEphem(EphemBasePtr ephem_ptr)
 {
-    double toe = time2sec(ephem_ptr->toe);
+    double toe = time2sec(ephem_ptr->toe); // 将时间转换为秒,such as x.y秒
     // if a new ephemeris comes
+    //  sat: satellite number，应该是卫星编号，如果没有这个卫星编号，那么说明观测到了一个新的卫星，就把它加到数组中
+    //  toe: 卫星的时间，如果说之前已经观测过这个卫星，这次又观测到，那么时间肯定不同了，因此也属于一个新的观测，加入数组中
     if (sat2time_index.count(ephem_ptr->sat) == 0 || sat2time_index.at(ephem_ptr->sat).count(toe) == 0)
     {
-        sat2ephem[ephem_ptr->sat].emplace_back(ephem_ptr);
+        sat2ephem[ephem_ptr->sat].emplace_back(ephem_ptr);  
         sat2time_index[ephem_ptr->sat].emplace(toe, sat2ephem.at(ephem_ptr->sat).size()-1);
     }
 }
 
+// 存储电离层参数到类成员变量中
 void Estimator::inputIonoParams(double ts, const std::vector<double> &iono_params)
 {
-    if (iono_params.size() != 8)    return;
+    // 电离层参数必须是8个
+    if (iono_params.size() != 8)    
+        return;
 
-    // update ionosphere parameters
+    // update ionosphere parameters 更新电离层的参数
     latest_gnss_iono_params.clear();
     std::copy(iono_params.begin(), iono_params.end(), std::back_inserter(latest_gnss_iono_params));
 }
@@ -254,26 +272,44 @@ void Estimator::inputGNSSTimeDiff(const double t_diff)
     diff_t_gnss_local = t_diff;
 }
 
+
+/**
+ * @brief 输入当前帧图像匹配的gnss观测信息，进行处理后放到estimator的类成员变量中
+ *    注意这里面会根据一些规则对接受到的卫星观测信息进行过滤，只会使用那种满足要求（比如比较稳定）的观测
+ * 
+ * @param[in] gnss_meas 输入的是这段时间接受到的卫星数据: 原始 measurements，包含Code Pseudorange 和Doppler Measurement
+
+ */
 void Estimator::processGNSS(const std::vector<ObsPtr> &gnss_meas)
 {
     std::vector<ObsPtr> valid_meas;
     std::vector<EphemBasePtr> valid_ephems;
+
+    // 遍历所有的卫星观测信息
     for (auto obs : gnss_meas)
     {
         // filter according to system
+        //  1.首先过滤观测的卫星系统，必须是四大卫星系统
         uint32_t sys = satsys(obs->sat, NULL);
         if (sys != SYS_GPS && sys != SYS_GLO && sys != SYS_GAL && sys != SYS_BDS)
             continue;
 
         // if not got cooresponding ephemeris yet
+        //  2.如果收到了观测，但是还没有收到星历中关于这个卫星的信息，那么这个观测也不能用
         if (sat2ephem.count(obs->sat) == 0)
             continue;
-        
-        if (obs->freqs.empty())    continue;       // no valid signal measurement
+
+        // L1频段的
+        //! 疑问：如果收到的卫星的频率vector是空，也不能用。这个没太明白
+        if (obs->freqs.empty())    
+            continue;       // no valid signal measurement
+        //  3.下面这个操作就是判断接收到的消息是否是L1频段的消息，只有L1频段的消息才使用
         int freq_idx = -1;
         L1_freq(obs, &freq_idx);
-        if (freq_idx < 0)   continue;              // no L1 observation
+        if (freq_idx < 0)   
+            continue;              // no L1 observation
         
+        // 4.星历信息要有效，否则不使用
         double obs_time = time2sec(obs->time);
         std::map<double, size_t> time2index = sat2time_index.at(obs->sat);
         double ephem_time = EPH_VALID_SECONDS;
@@ -294,6 +330,7 @@ void Estimator::processGNSS(const std::vector<ObsPtr> &gnss_meas)
         const EphemBasePtr &best_ephem = sat2ephem.at(obs->sat).at(ephem_index);
 
         // filter by tracking status
+        // 5.这个卫星的跟踪次数要足够，这样才比较稳定，否则不使用
         LOG_IF(FATAL, freq_idx < 0) << "No L1 observation found.\n";
         if (obs->psr_std[freq_idx]  > GNSS_PSR_STD_THRES ||
             obs->dopp_std[freq_idx] > GNSS_DOPP_STD_THRES)
@@ -311,31 +348,44 @@ void Estimator::processGNSS(const std::vector<ObsPtr> &gnss_meas)
             continue;           // not being tracked for enough epochs
 
         // filter by elevation angle
+        //  6.卫星的仰角越小，说明是低空卫星，会受到更大的电离层延时、多路径效应的影响，也不使用
         if (gnss_ready)
         {
+            // 计算卫星的 ecef 坐标
             Eigen::Vector3d sat_ecef;
             if (sys == SYS_GLO)
                 sat_ecef = geph2pos(obs->time, std::dynamic_pointer_cast<GloEphem>(best_ephem), NULL);
             else
                 sat_ecef = eph2pos(obs->time, std::dynamic_pointer_cast<Ephem>(best_ephem), NULL);
+
+            // 根据 卫星和接受的ECEF坐标，计算 azimuth/elevation angle
             double azel[2] = {0, M_PI/2.0};
             sat_azel(ecef_pos, sat_ecef, azel);
             if (azel[1] < GNSS_ELEVATION_THRES*M_PI/180.0)
                 continue;
         }
+
+        //; 经过上述的判断之后，把有效的观测和星历数据都存储起来
         valid_meas.push_back(obs);
         valid_ephems.push_back(best_ephem);
     }
     
+    // 把处理后的观测信息和星历信息存到类成员变量中
     gnss_meas_buf[frame_count] = valid_meas;
     gnss_ephem_buf[frame_count] = valid_ephems;
 }
-
+/**
+ * @brief 使用sfm算法处理图像，并将其与IMU对齐，与VI初始化相同
+ * 
+ * @return true 
+ * @return false 
+ */
 bool Estimator::initialStructure()
 {
     TicToc t_sfm;
-    //check imu observibility
+    //check imu observibility，计算IMU预积分的加速度方差，以判断IMU是否活跃
     {
+        // 计算加速度均值
         map<double, ImageFrame>::iterator frame_it;
         Vector3d sum_g;
         for (frame_it = all_image_frame.begin(), frame_it++; frame_it != all_image_frame.end(); frame_it++)
@@ -346,6 +396,7 @@ bool Estimator::initialStructure()
         }
         Vector3d aver_g;
         aver_g = sum_g * 1.0 / ((int)all_image_frame.size() - 1);
+        // 计算加速度方差
         double var = 0;
         for (frame_it = all_image_frame.begin(), frame_it++; frame_it != all_image_frame.end(); frame_it++)
         {
@@ -367,9 +418,10 @@ bool Estimator::initialStructure()
     Vector3d T[frame_count + 1];
     map<int, Vector3d> sfm_tracked_points;
     vector<SFMFeature> sfm_f;
+    // 将特征对应的所有图像帧上的二维点存储在sfm_f中
     for (auto &it_per_id : f_manager.feature)
     {
-        int imu_j = it_per_id.start_frame - 1;
+        int imu_j = it_per_id.start_frame - 1; //start_frame代表观测到该特征的第一帧
         SFMFeature tmp_feature;
         tmp_feature.state = false;
         tmp_feature.id = it_per_id.feature_id;
@@ -384,12 +436,14 @@ bool Estimator::initialStructure()
     Matrix3d relative_R;
     Vector3d relative_T;
     int l;
+    // 找出与最新帧相关性强且有足够视差的帧l
     if (!relativePose(relative_R, relative_T, l))
     {
         ROS_INFO("Not enough features or parallax; Move device around");
         return false;
     }
     GlobalSFM sfm;
+    // sfm算法，三角化了特征点，并建立了以帧l为参考的位姿Q,T
     if(!sfm.construct(frame_count + 1, Q, T, l,
               relative_R, relative_T,
               sfm_f, sfm_tracked_points))
@@ -407,6 +461,7 @@ bool Estimator::initialStructure()
     {
         // provide initial guess
         cv::Mat r, rvec, t, D, tmp_r;
+         // 对于关键帧，直接赋值，不做PnP
         if((frame_it->first) == Headers[i].stamp.toSec())
         {
             frame_it->second.is_key_frame = true;
@@ -422,18 +477,19 @@ bool Estimator::initialStructure()
         Matrix3d R_inital = (Q[i].inverse()).toRotationMatrix();
         Vector3d P_inital = - R_inital * T[i];
         cv::eigen2cv(R_inital, tmp_r);
-        cv::Rodrigues(tmp_r, rvec);
+        cv::Rodrigues(tmp_r, rvec); //罗德里格斯公式,将旋转矩阵转化为旋转向量，或将旋转向量转化为旋转矩阵
         cv::eigen2cv(P_inital, t);
 
         frame_it->second.is_key_frame = false;
         vector<cv::Point3f> pts_3_vector;
         vector<cv::Point2f> pts_2_vector;
+        // 对该帧中所有的点建立对应的3d-2d匹配
         for (auto &id_pts : frame_it->second.points)
         {
             int feature_id = id_pts.first;
             for (auto &i_p : id_pts.second)
             {
-                it = sfm_tracked_points.find(feature_id);
+                it = sfm_tracked_points.find(feature_id); // 该代码与最近的循环无关，提到上一层循环中应是等效的
                 if(it != sfm_tracked_points.end())
                 {
                     Vector3d world_pts = it->second;
@@ -452,11 +508,19 @@ bool Estimator::initialStructure()
             ROS_DEBUG("Not enough points for solve pnp !");
             return false;
         }
+        /* 使用PnP方法
+        K为内参，因为用的二维点是相机归一化平面上的点，所以这里的K为单位阵
+        D为畸变矩阵
+        rvec, t分别是旋转向量和位移
+        1 代表使用初始值迭代优化，Parameter used for SOLVEPNP_ITERATIVE. 
+        采用的solvePnP方式，CV_P3P、CV_EPNP、CV_ITERATIVE，默认采用CV_ITERATIVE)
+        */
         if (! cv::solvePnP(pts_3_vector, pts_2_vector, K, D, rvec, t, 1))
         {
             ROS_DEBUG("solve pnp fail!");
             return false;
         }
+        
         cv::Rodrigues(rvec, r);
         MatrixXd R_pnp,tmp_R_pnp;
         cv::cv2eigen(r, tmp_R_pnp);
@@ -476,10 +540,16 @@ bool Estimator::initialStructure()
     return true;
 }
 
+/**
+ * @brief 将视觉信息与IMU对齐，对齐到第0帧
+ * 
+ * @return true 
+ * @return false 
+ */
 bool Estimator::visualInitialAlign()
 {
     TicToc t_g;
-    VectorXd x;
+    VectorXd x; // v1, ...,vn,g,s
     //solve scale
     bool result = VisualIMUAlignment(all_image_frame, Bgs, g, x);
     if(!result)
@@ -489,6 +559,7 @@ bool Estimator::visualInitialAlign()
     }
 
     // change state
+    
     for (int i = 0; i <= frame_count; i++)
     {
         Matrix3d Ri = all_image_frame[Headers[i].stamp.toSec()].R;
@@ -500,8 +571,8 @@ bool Estimator::visualInitialAlign()
 
     VectorXd dep = f_manager.getDepthVector();
     for (int i = 0; i < dep.size(); i++)
-        dep[i] = -1;
-    f_manager.clearDepth(dep);
+        dep[i] = -1; //标记有效的地图点
+    f_manager.clearDepth(dep); // 将所有特征点的深度置为-1
 
     //triangulate on cam pose , no tic
     Vector3d TIC_TMP[NUM_OF_CAM];
@@ -509,14 +580,17 @@ bool Estimator::visualInitialAlign()
         TIC_TMP[i].setZero();
     ric[0] = RIC[0];
     f_manager.setRic(ric);
-    f_manager.triangulate(Ps, &(TIC_TMP[0]), &(RIC[0]));
-
+    // 在第0帧中的特征点
+    f_manager.triangulate(Ps, &(TIC_TMP[0]), &(RIC[0])); 
+    // 滑窗内，重新推算预积分
     double s = (x.tail<1>())(0);
     for (int i = 0; i <= WINDOW_SIZE; i++)
     {
         pre_integrations[i]->repropagate(Vector3d::Zero(), Bgs[i]);
     }
+    // 开始将所有状态对齐到第0帧
     for (int i = frame_count; i >= 0; i--)
+        // twi-tw0, 对齐到第0帧
         Ps[i] = s * Ps[i] - Rs[i] * TIC[0] - (s * Ps[0] - Rs[0] * TIC[0]);
     int kv = -1;
     map<double, ImageFrame>::iterator frame_i;
@@ -525,9 +599,11 @@ bool Estimator::visualInitialAlign()
         if(frame_i->second.is_key_frame)
         {
             kv++;
+            // 之前获得的速度是IMu坐标系，现在转到world系
             Vs[kv] = frame_i->second.R * x.segment<3>(kv * 3);
         }
     }
+    // 为3D点恢复深度
     for (auto &it_per_id : f_manager.feature)
     {
         it_per_id.used_num = it_per_id.feature_per_frame.size();
@@ -535,16 +611,16 @@ bool Estimator::visualInitialAlign()
             continue;
         it_per_id.estimated_depth *= s;
     }
-
-    Matrix3d R0 = Utility::g2R(g);
-    double yaw = Utility::R2ypr(R0 * Rs[0]).x();
-    R0 = Utility::ypr2R(Eigen::Vector3d{-yaw, 0, 0}) * R0;
+    // 将所有P，V，Q全部对齐到第0帧，同时与重力方向对齐
+    Matrix3d R0 = Utility::g2R(g); // 将枢纽帧l的重力方向转为旋转矩阵，yaw角置零，得到Rwj
+    double yaw = Utility::R2ypr(R0 * Rs[0]).x(); // 
+    R0 = Utility::ypr2R(Eigen::Vector3d{-yaw, 0, 0}) * R0; //第0帧的yaw角置零
     g = R0 * g;
     //Matrix3d rot_diff = R0 * Rs[0].transpose();
     Matrix3d rot_diff = R0;
     for (int i = 0; i <= frame_count; i++)
     {
-        Ps[i] = rot_diff * Ps[i];
+        Ps[i] = rot_diff * Ps[i]; //全部对齐到重力下，同时yaw角对齐到第0帧
         Rs[i] = rot_diff * Rs[i];
         Vs[i] = rot_diff * Vs[i];
     }
@@ -555,6 +631,12 @@ bool Estimator::visualInitialAlign()
     return true;
 }
 
+/**
+ * @brief GNSS和VIO之间的初始化
+ * 
+ * @return true 
+ * @return false 
+ */
 bool Estimator::GNSSVIAlign()
 {
     if (solver_flag == INITIAL)     // visual-inertial not initialized
@@ -565,11 +647,14 @@ bool Estimator::GNSSVIAlign()
     
     for (uint32_t i = 0; i < (WINDOW_SIZE+1); ++i)
     {
-        if (gnss_meas_buf[i].empty() || gnss_meas_buf[i].size() < 10)
+        // 滑窗内gnss信息不能为空，
+        //! 注意：这里又出现了对于gnss观测不能少于10个要求，不知道这个10个卫星的要求是这么来的？
+        if (gnss_meas_buf[i].empty() || gnss_meas_buf[i].size() < 10) 
             return false;
     }
 
-    // check horizontal velocity excitation
+    // check horizontal velocity excitation，如果水平速度小于0.3m/s,GNSS对齐失败
+    //; 这个地方和退化情况一样，速度太低的话多普勒频移都是噪声
     Eigen::Vector2d avg_hor_vel(0.0, 0.0);
     for (uint32_t i = 0; i < (WINDOW_SIZE+1); ++i)
         avg_hor_vel += Vs[i].head<2>().cwiseAbs();
@@ -580,6 +665,7 @@ bool Estimator::GNSSVIAlign()
         return false;
     }
 
+    // 将当前GNSS信息记录起来
     std::vector<std::vector<ObsPtr>> curr_gnss_meas_buf;
     std::vector<std::vector<EphemBasePtr>> curr_gnss_ephem_buf;
     for (uint32_t i = 0; i < (WINDOW_SIZE+1); ++i)
@@ -588,10 +674,12 @@ bool Estimator::GNSSVIAlign()
         curr_gnss_ephem_buf.push_back(gnss_ephem_buf[i]);
     }
 
+    //; 传入观测信息、星历信息、最新的电离层参数等信息，构造一个GNSS-VIO的初始化器
     GNSSVIInitializer gnss_vi_initializer(curr_gnss_meas_buf, curr_gnss_ephem_buf, latest_gnss_iono_params);
 
+    // Step 1. SPP单点定位，得到一个锚点的粗略的位置
     // 1. get a rough global location
-    Eigen::Matrix<double, 7, 1> rough_xyzt;
+    Eigen::Matrix<double, 7, 1> rough_xyzt; //; 返回值为锚点的位置xyz, 以及四个卫星系统的时间零偏t1-4
     rough_xyzt.setZero();
     if (!gnss_vi_initializer.coarse_localization(rough_xyzt))
     {
@@ -599,13 +687,14 @@ bool Estimator::GNSSVIAlign()
         return false;
     }
 
+    // Step 2. 使用多普勒频移进行yaw角的对齐
     // 2. perform yaw alignment
     std::vector<Eigen::Vector3d> local_vs;
     for (uint32_t i = 0; i < (WINDOW_SIZE+1); ++i)
         local_vs.push_back(Vs[i]);
     Eigen::Vector3d rough_anchor_ecef = rough_xyzt.head<3>();
     double aligned_yaw = 0;
-    double aligned_rcv_ddt = 0;
+    double aligned_rcv_ddt = 0; //时间漂移率
     if (!gnss_vi_initializer.yaw_alignment(local_vs, rough_anchor_ecef, aligned_yaw, aligned_rcv_ddt))
     {
         std::cerr << "Fail to align ENU and local frames.\n";
@@ -613,6 +702,7 @@ bool Estimator::GNSSVIAlign()
     }
     // std::cout << "aligned_yaw is " << aligned_yaw*180.0/M_PI << '\n';
 
+    // Step 3. 执行锚点的细化
     // 3. perform anchor refinement
     std::vector<Eigen::Vector3d> local_ps;
     for (uint32_t i = 0; i < (WINDOW_SIZE+1); ++i)
@@ -638,11 +728,13 @@ bool Estimator::GNSSVIAlign()
             break;
         }
     }
+    // 保存时漂和时偏，对于没有观测到的卫星系统时偏，赋一个观测到的卫星系统时偏
     for (uint32_t i = 0; i < (WINDOW_SIZE+1); ++i)
     {
         para_rcv_ddt[i] = aligned_rcv_ddt;
         for (uint32_t k = 0; k < 4; ++k)
         {
+           
             if (rough_xyzt(k+3) == 0)
                 para_rcv_dt[i*4+k] = refined_xyzt(3+one_observed_sys) + aligned_rcv_ddt * i;
             else
@@ -651,11 +743,11 @@ bool Estimator::GNSSVIAlign()
     }
     anc_ecef = refined_xyzt.head<3>();
     R_ecef_enu = ecef2rotation(anc_ecef);
-
     yaw_enu_local = aligned_yaw;
 
     return true;
 }
+
 
 void Estimator::updateGNSSStatistics()
 {
@@ -666,7 +758,10 @@ void Estimator::updateGNSSStatistics()
     ecef_pos = anc_ecef + R_ecef_enu * enu_pos;
 }
 
-
+/**
+ * @brief 找出一个参考的帧l，使其与最新帧有足够的相关性和视差，并求解两者的相对位姿
+ * 
+ */
 bool Estimator::relativePose(Matrix3d &relative_R, Vector3d &relative_T, int &l)
 {
     // find previous frame which contians enough correspondance and parallex with newest frame
@@ -674,6 +769,7 @@ bool Estimator::relativePose(Matrix3d &relative_R, Vector3d &relative_T, int &l)
     {
         vector<pair<Vector3d, Vector3d>> corres;
         corres = f_manager.getCorresponding(i, WINDOW_SIZE);
+        // 与最后一帧有20个以上的匹配点
         if (corres.size() > 20)
         {
             double sum_parallax = 0;
@@ -705,11 +801,15 @@ void Estimator::solveOdometry()
     if (solver_flag == NON_LINEAR)
     {
         TicToc t_tri;
+        // 三角化
         f_manager.triangulate(Ps, tic, ric);
         ROS_DEBUG("triangulation costs %f", t_tri.toc());
+        // 后端优化
         optimization();
+
         if (GNSS_ENABLE)
         {
+            //; 如果还没有进行gnss的初始化，则对gnss进行初始化
             if (!gnss_ready)
             {
                 gnss_ready = GNSSVIAlign();
@@ -864,16 +964,21 @@ void Estimator::optimization()
     ceres::LossFunction *loss_function;
     //loss_function = new ceres::HuberLoss(1.0);
     loss_function = new ceres::CauchyLoss(1.0);
+
+    // Step 1. 添加优化变量
+    // Step 1.1. 添加滑窗中每一帧的位姿，作为优化变量
     for (int i = 0; i < WINDOW_SIZE + 1; i++)
     {
         ceres::LocalParameterization *local_parameterization = new PoseLocalParameterization();
         problem.AddParameterBlock(para_Pose[i], SIZE_POSE, local_parameterization);
         problem.AddParameterBlock(para_SpeedBias[i], SIZE_SPEEDBIAS);
     }
+    // Step 1.2. 添加VI的外参，作为优化变量
     for (int i = 0; i < NUM_OF_CAM; i++)
     {
         ceres::LocalParameterization *local_parameterization = new PoseLocalParameterization();
         problem.AddParameterBlock(para_Ex_Pose[i], SIZE_POSE, local_parameterization);
+        // 如果不需要优化外参，设置constant
         if (!ESTIMATE_EXTRINSIC)
         {
             ROS_DEBUG("fix extinsic param");
@@ -882,45 +987,56 @@ void Estimator::optimization()
         else
             ROS_DEBUG("estimate extinsic param");
     }
+    // Step 1.3. 添加VI的时间延时，作为优化变量
     if (ESTIMATE_TD)
     {
         problem.AddParameterBlock(para_Td[0], 1);
     }
 
+    // Step 1.4. 如果GNSS已经初始化成功，则添加和GNSS有关的优化变量
     if (gnss_ready)
     {
+        // Step 1.4.1. yaw角添加残差块
         problem.AddParameterBlock(para_yaw_enu_local, 1);
         Eigen::Vector2d avg_hor_vel(0.0, 0.0);
         for (uint32_t i = 0; i <= WINDOW_SIZE; ++i)
-            avg_hor_vel += Vs[i].head<2>().cwiseAbs();
-        avg_hor_vel /= (WINDOW_SIZE+1);
+            avg_hor_vel += Vs[i].head<2>().cwiseAbs();   // cwiseAbs逐个元素取绝对值
+        avg_hor_vel /= (WINDOW_SIZE+1);  // 统计滑窗内的速度平均值
         // cerr << "avg_hor_vel is " << avg_vel << endl;
+
+        //; 论文退化情况1：平均速度<0.3, 此时速度低于多普勒频移的噪声水平，yaw角可能会被噪声破坏，因此固定yaw角不优化
         if (avg_hor_vel.norm() < 0.3)
         {
             // std::cerr << "velocity excitation not enough, fix yaw angle.\n";
             problem.SetParameterBlockConstant(para_yaw_enu_local);
         }
-
+        //! 疑问：只要有一帧的卫星观测信息 < 10, 就设置yaw角固定？
         for (uint32_t i = 0; i <= WINDOW_SIZE; ++i)
         {
             if (gnss_meas_buf[i].size() < 10)
                 problem.SetParameterBlockConstant(para_yaw_enu_local);
         }
-        
+
+        // Step 1.4.2. ECEF锚点平移添加残差块
         problem.AddParameterBlock(para_anc_ecef, 3);
         // problem.SetParameterBlockConstant(para_anc_ecef);
 
+        // Step 1.4.3. 添加时钟误差和时钟漂移率残差块
         for (uint32_t i = 0; i <= WINDOW_SIZE; ++i)
         {
+            //; 注意这个for循环是因为4大卫星系统都各自有一个时间的零偏
             for (uint32_t k = 0; k < 4; ++k)
-                problem.AddParameterBlock(para_rcv_dt+i*4+k, 1);
-            problem.AddParameterBlock(para_rcv_ddt+i, 1);
+                problem.AddParameterBlock(para_rcv_dt + i*4 + k, 1);
+            problem.AddParameterBlock(para_rcv_ddt + i, 1);
         }
     }
 
     TicToc t_whole, t_prepare;
+    //转成ceres的double类型
     vector2double();
 
+    // Step 2 添加约束边，即各种因子
+    // Step 2.1. 首次优化固定锚点变量，如果没有重启，则只会执行一次
     if (first_optimization)
     {
         std::vector<double> anchor_value;
@@ -931,6 +1047,7 @@ void Estimator::optimization()
         first_optimization = false;
     }
 
+    // Step 2.2. 上次边缘化的先验信息
     if (last_marginalization_info)
     {
         // construct new marginlization_factor
@@ -939,6 +1056,7 @@ void Estimator::optimization()
                                  last_marginalization_parameter_blocks);
     }
 
+    // Step 2.3. 添加预积分残差
     for (int i = 0; i < WINDOW_SIZE; i++)
     {
         int j = i + 1;
@@ -948,69 +1066,102 @@ void Estimator::optimization()
         problem.AddResidualBlock(imu_factor, NULL, para_Pose[i], para_SpeedBias[i], para_Pose[j], para_SpeedBias[j]);
     }
 
+    // Step 2.4. 添加gnss残差块
     if (gnss_ready)
-    {
+    {   
+        // Step 2.4.1. 添加伪距和多普勒因子
+        //; 论文退化情况2：观测卫星数量少于4颗，实际无需处理，因此代码中也没有特殊的处理
         for(int i = 0; i <= WINDOW_SIZE; ++i)
         {
             // cerr << "size of gnss_meas_buf[" << i << "] is " << gnss_meas_buf[i].size() << endl;
             const std::vector<ObsPtr> &curr_obs = gnss_meas_buf[i];
             const std::vector<EphemBasePtr> &curr_ephem = gnss_ephem_buf[i];
 
+            // 遍历这个关键帧的所有卫星观测信息
             for (uint32_t j = 0; j < curr_obs.size(); ++j)
-            {
+            {   
+                // sys表示这个观测属于哪个卫星系统的观测
                 const uint32_t sys = satsys(curr_obs[j]->sat, NULL);
+                // sys_idx表示这个卫星的编号
+                //! 疑问：这个编号的意思应该是1234，表示是4大卫星系统中的哪一个？
                 const uint32_t sys_idx = gnss_comm::sys2idx.at(sys);
 
                 int lower_idx = -1;
+                // 把gnss时间去掉和本地VI时间的偏执，尽量先保持一致
                 const double obs_local_ts = time2sec(curr_obs[j]->time) - diff_t_gnss_local;
+                // VIO的时间 > 卫星时间，则gnss时间在当前图像帧和上一个图像帧之间
                 if (Headers[i].stamp.toSec() > obs_local_ts)
                     lower_idx = (i==0? 0 : i-1);
+                // VIO的时间 < 卫星时间，则gnss时间在当前图像帧和下一个图像帧之间
                 else
                     lower_idx = (i==WINDOW_SIZE? WINDOW_SIZE-1 : i);
+                // 设置当前卫星时间对应于图像时间的前后帧
                 const double lower_ts = Headers[lower_idx].stamp.toSec();
                 const double upper_ts = Headers[lower_idx+1].stamp.toSec();
-
+                // 时间比率，是指当前卫星时间占图像时间间隔的后半部分的时间
                 const double ts_ratio = (upper_ts-obs_local_ts) / (upper_ts-lower_ts);
+                //; 构造伪距和多普勒因子，传参（观测信息，星历信息，最新的电离层延迟，卫星时间占后面的时间比例）
                 GnssPsrDoppFactor *gnss_factor = new GnssPsrDoppFactor(curr_obs[j], 
                     curr_ephem[j], latest_gnss_iono_params, ts_ratio);
-                problem.AddResidualBlock(gnss_factor, NULL, para_Pose[lower_idx], 
-                    para_SpeedBias[lower_idx], para_Pose[lower_idx+1], para_SpeedBias[lower_idx+1],
-                    para_rcv_dt+i*4+sys_idx, para_rcv_ddt+i, para_yaw_enu_local, para_anc_ecef);
+                //; 把多普勒因子加到残差块中，其中变量分别为：
+                // 伪距和多普勒因子的类，鲁棒核函数，
+                // 前一帧图像的位姿，前一帧图像的速度零偏，后一帧图像的位姿，后一帧图像的速度零偏
+                // 当前帧的接收机时间零偏，时间零偏变化率
+                // yaw角的偏置，锚点的位置
+                problem.AddResidualBlock(gnss_factor, NULL, 
+                    para_Pose[lower_idx], para_SpeedBias[lower_idx], para_Pose[lower_idx+1], para_SpeedBias[lower_idx+1],
+                    para_rcv_dt+i*4+sys_idx, para_rcv_ddt+i, 
+                    para_yaw_enu_local, para_anc_ecef);
             }
         }
 
+        // Step 2.4.2. 添加时间零偏和零偏变化率因子
+        //; 论文退化情况3：不管有没有卫星观测，接收机时间零偏和零偏的变化率的约束都成立
         // build relationship between rcv_dt and rcv_ddt
+        // 公式(23)，时间零偏靠零偏的变化率来约束
+        // 注意这里for k < 4的遍历是因为4大卫星系统都有一个时间零偏
         for (size_t k = 0; k < 4; ++k)
         {
             for (uint32_t i = 0; i < WINDOW_SIZE; ++i)
             {
+                // τ_k-1^k
                 const double gnss_dt = Headers[i+1].stamp.toSec() - Headers[i].stamp.toSec();
+                //; 时间零偏和零偏之间变化的因子
                 DtDdtFactor *dt_ddt_factor = new DtDdtFactor(gnss_dt);
-                problem.AddResidualBlock(dt_ddt_factor, NULL, para_rcv_dt+i*4+k, 
-                    para_rcv_dt+(i+1)*4+k, para_rcv_ddt+i, para_rcv_ddt+i+1);
+                //; 添加零偏和零偏变化率因子到残差块中，其中的参数：
+                // 零偏和零偏变化率的类，鲁棒核函数
+                // 前一帧的时间零偏，下一帧的时间零偏
+                // 前一帧的时间零偏的变化率，下一帧的时间零偏的变化率
+                problem.AddResidualBlock(dt_ddt_factor, NULL, 
+                    para_rcv_dt+i*4+k, para_rcv_dt+(i+1)*4+k, 
+                    para_rcv_ddt+i, para_rcv_ddt+i+1);
             }
         }
 
         // add rcv_ddt smooth factor
+        // 公式(24)，时间零偏的变化率靠随机游走模型来约束
         for (int i = 0; i < WINDOW_SIZE; ++i)
         {
+            //; 时间零偏变化率的随机游走因子
             DdtSmoothFactor *ddt_smooth_factor = new DdtSmoothFactor(GNSS_DDT_WEIGHT);
+            //; 把时间零偏变化率的随机游走因子加到残差块中，其中的参数：
+            // 时间零偏变化率随机游走因子，鲁棒核函数，前一阵的时间零偏变化率，后一帧的时间零偏变化率
             problem.AddResidualBlock(ddt_smooth_factor, NULL, para_rcv_ddt+i, para_rcv_ddt+i+1);
         }
     }
 
     int f_m_cnt = 0;
     int feature_index = -1;
+    // Step 2.5. 添加视觉残差块
     for (auto &it_per_id : f_manager.feature)
     {
         it_per_id.used_num = it_per_id.feature_per_frame.size();
         if (!(it_per_id.used_num >= 2 && it_per_id.start_frame < WINDOW_SIZE - 2))
             continue;
- 
+
         ++feature_index;
 
         int imu_i = it_per_id.start_frame, imu_j = imu_i - 1;
-        
         Vector3d pts_i = it_per_id.feature_per_frame[0].point;
 
         for (auto &it_per_frame : it_per_id.feature_per_frame)
@@ -1023,7 +1174,7 @@ void Estimator::optimization()
             Vector3d pts_j = it_per_frame.point;
             if (ESTIMATE_TD)
             {
-                    ProjectionTdFactor *f_td = new ProjectionTdFactor(pts_i, pts_j, 
+                    ProjectionTdFactor *f_td = new ProjectionTdFactor(pts_i, pts_j,
                         it_per_id.feature_per_frame[0].velocity, it_per_frame.velocity,
                         it_per_id.feature_per_frame[0].cur_td, it_per_frame.cur_td);
                     problem.AddResidualBlock(f_td, loss_function, para_Pose[imu_i], para_Pose[imu_j], para_Ex_Pose[0], para_Feature[feature_index], para_Td[0]);
@@ -1040,6 +1191,7 @@ void Estimator::optimization()
     ROS_DEBUG("visual measurement count: %d", f_m_cnt);
     ROS_DEBUG("prepare for ceres: %f", t_prepare.toc());
 
+    // Step 3. 执行优化
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::DENSE_SCHUR;
     //options.num_threads = 2;
@@ -1066,12 +1218,16 @@ void Estimator::optimization()
 
     double2vector();
 
+    // Step 4 优化完成，计算边缘化
+    //仿照ceres的构造模式进行边缘化操作
     TicToc t_whole_marginalization;
     if (marginalization_flag == MARGIN_OLD)
     {
         MarginalizationInfo *marginalization_info = new MarginalizationInfo();
+        //eigen 转成 double 类型
         vector2double();
 
+        //添加先验约束
         if (last_marginalization_info)
         {
             vector<int> drop_set;
@@ -1100,16 +1256,18 @@ void Estimator::optimization()
         }
 
         {
+            //如果预积分时间过长 不可信
             if (pre_integrations[1]->sum_dt < 10.0)
             {
                 IMUFactor* imu_factor = new IMUFactor(pre_integrations[1]);
                 ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(imu_factor, NULL,
                                                                            vector<double *>{para_Pose[0], para_SpeedBias[0], para_Pose[1], para_SpeedBias[1]},
-                                                                           vector<int>{0, 1});
+                                                                           vector<int>{0, 1});//（残差雅可比，核函数，涉及参数快，被边缘化索引）
                 marginalization_info->addResidualBlockInfo(residual_block_info);
             }
         }
 
+        //; 如果GNSS已经初始化过了，那么这里也要计算GNSS的边缘化结果
         if (gnss_ready)
         {
             for (uint32_t j = 0; j < gnss_meas_buf[0].size(); ++j)
@@ -1122,11 +1280,11 @@ void Estimator::optimization()
                 const double upper_ts = Headers[1].stamp.toSec();
                 const double ts_ratio = (upper_ts-obs_local_ts) / (upper_ts-lower_ts);
 
-                GnssPsrDoppFactor *gnss_factor = new GnssPsrDoppFactor(gnss_meas_buf[0][j], 
+                GnssPsrDoppFactor *gnss_factor = new GnssPsrDoppFactor(gnss_meas_buf[0][j],
                     gnss_ephem_buf[0][j], latest_gnss_iono_params, ts_ratio);
                 ResidualBlockInfo *psr_dopp_residual_block_info = new ResidualBlockInfo(gnss_factor, NULL,
-                    vector<double *>{para_Pose[0], para_SpeedBias[0], para_Pose[1], 
-                        para_SpeedBias[1],para_rcv_dt+sys_idx, para_rcv_ddt, 
+                    vector<double *>{para_Pose[0], para_SpeedBias[0], para_Pose[1],
+                        para_SpeedBias[1],para_rcv_dt+sys_idx, para_rcv_ddt,
                         para_yaw_enu_local, para_anc_ecef},
                     vector<int>{0, 1, 4, 5});
                 marginalization_info->addResidualBlockInfo(psr_dopp_residual_block_info);
@@ -1149,22 +1307,25 @@ void Estimator::optimization()
             marginalization_info->addResidualBlockInfo(ddt_smooth_residual_block_info);
         }
 
+        //遍历视觉重投影约束
         {
             int feature_index = -1;
+            //遍历特征点管理器
             for (auto &it_per_id : f_manager.feature)
             {
                 it_per_id.used_num = it_per_id.feature_per_frame.size();
+                //被两帧以上观察到，起始帧在倒数第二帧之前
                 if (!(it_per_id.used_num >= 2 && it_per_id.start_frame < WINDOW_SIZE - 2))
                     continue;
 
                 ++feature_index;
-
                 int imu_i = it_per_id.start_frame, imu_j = imu_i - 1;
+                //起始帧不等于0，跳过
                 if (imu_i != 0)
                     continue;
-
+                //该特征点在起始帧的3d点
                 Vector3d pts_i = it_per_id.feature_per_frame[0].point;
-
+                //遍历观测到该点的帧
                 for (auto &it_per_frame : it_per_id.feature_per_frame)
                 {
                     imu_j++;
@@ -1185,6 +1346,7 @@ void Estimator::optimization()
                     }
                     else
                     {
+                        //视觉残差会有核函数
                         ProjectionFactor *f = new ProjectionFactor(pts_i, pts_j);
                         ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(f, 
                             loss_function, vector<double *>{para_Pose[imu_i], para_Pose[imu_j], 
@@ -1199,7 +1361,7 @@ void Estimator::optimization()
         TicToc t_pre_margin;
         marginalization_info->preMarginalize();
         ROS_DEBUG("pre marginalization %f ms", t_pre_margin.toc());
-        
+
         TicToc t_margin;
         marginalization_info->marginalize();
         ROS_DEBUG("marginalization %f ms", t_margin.toc());
@@ -1227,10 +1389,11 @@ void Estimator::optimization()
             delete last_marginalization_info;
         last_marginalization_info = marginalization_info;
         last_marginalization_parameter_blocks = parameter_blocks;
-        
+
     }
     else
-    {
+    {   
+        //边缘化次新帧
         if (last_marginalization_info &&
             std::count(std::begin(last_marginalization_parameter_blocks), std::end(last_marginalization_parameter_blocks), para_Pose[WINDOW_SIZE - 1]))
         {
@@ -1242,11 +1405,13 @@ void Estimator::optimization()
                 vector<int> drop_set;
                 for (int i = 0; i < static_cast<int>(last_marginalization_parameter_blocks.size()); i++)
                 {
+                    //上一次边缘化的是关键帧，不会出现预积分约束
                     ROS_ASSERT(last_marginalization_parameter_blocks[i] != para_SpeedBias[WINDOW_SIZE - 1]);
+                    //找到与倒数第二帧的位姿参数块
                     if (last_marginalization_parameter_blocks[i] == para_Pose[WINDOW_SIZE - 1])
                         drop_set.push_back(i);
                 }
-                // construct new marginlization_factor
+                // 构建新的残差块
                 MarginalizationFactor *marginalization_factor = new MarginalizationFactor(last_marginalization_info);
                 ResidualBlockInfo *residual_block_info = new ResidualBlockInfo(marginalization_factor, NULL,
                                                                                last_marginalization_parameter_blocks,
@@ -1264,7 +1429,7 @@ void Estimator::optimization()
             ROS_DEBUG("begin marginalization");
             marginalization_info->marginalize();
             ROS_DEBUG("end marginalization, %f ms", t_margin.toc());
-            
+
             std::unordered_map<long, double *> addr_shift;
             for (int i = 0; i <= WINDOW_SIZE; i++)
             {
@@ -1300,11 +1465,11 @@ void Estimator::optimization()
                 delete last_marginalization_info;
             last_marginalization_info = marginalization_info;
             last_marginalization_parameter_blocks = parameter_blocks;
-            
+
         }
     }
     ROS_DEBUG("whole marginalization costs: %f", t_whole_marginalization.toc());
-    
+
     ROS_DEBUG("whole time for ceres: %f", t_whole.toc());
 }
 
@@ -1316,8 +1481,10 @@ void Estimator::slideWindow()
         double t_0 = Headers[0].stamp.toSec();
         back_R0 = Rs[0];
         back_P0 = Ps[0];
+        //滑窗向前推
         if (frame_count == WINDOW_SIZE)
         {
+            //一帧帧交换
             for (int i = 0; i < WINDOW_SIZE; i++)
             {
                 Rs[i].swap(Rs[i + 1]);
@@ -1353,19 +1520,21 @@ void Estimator::slideWindow()
             gnss_ephem_buf[WINDOW_SIZE].clear();
 
             delete pre_integrations[WINDOW_SIZE];
+            //等IMU值进入重新预积分
             pre_integrations[WINDOW_SIZE] = new IntegrationBase{acc_0, gyr_0, Bas[WINDOW_SIZE], Bgs[WINDOW_SIZE]};
 
             dt_buf[WINDOW_SIZE].clear();
             linear_acceleration_buf[WINDOW_SIZE].clear();
             angular_velocity_buf[WINDOW_SIZE].clear();
 
+            //初始化相关操作
             if (true || solver_flag == INITIAL)
             {
                 map<double, ImageFrame>::iterator it_0;
+                //all_image_frame 和初始化相关
                 it_0 = all_image_frame.find(t_0);
                 delete it_0->second.pre_integration;
                 it_0->second.pre_integration = nullptr;
- 
                 for (map<double, ImageFrame>::iterator it = all_image_frame.begin(); it != it_0; ++it)
                 {
                     if (it->second.pre_integration)
@@ -1384,6 +1553,7 @@ void Estimator::slideWindow()
     {
         if (frame_count == WINDOW_SIZE)
         {
+            //合并预计分的值
             for (unsigned int i = 0; i < dt_buf[frame_count].size(); i++)
             {
                 double tmp_dt = dt_buf[frame_count][i];
@@ -1431,20 +1601,23 @@ void Estimator::slideWindowNew()
     sum_of_front++;
     f_manager.removeFront(frame_count);
 }
+
 // real marginalization is removed in solve_ceres()
+//地图点逆深度保存在第一个观察到的帧，如果边缘化掉最后一点，则赋给下一帧
 void Estimator::slideWindowOld()
 {
     sum_of_back++;
-
+    //更新特征点逆深度的起始帧
     bool shift_depth = solver_flag == NON_LINEAR ? true : false;
     if (shift_depth)
     {
         Matrix3d R0, R1;
         Vector3d P0, P1;
-        R0 = back_R0 * ric[0];
-        R1 = Rs[0] * ric[0];
-        P0 = back_P0 + back_R0 * tic[0];
-        P1 = Ps[0] + Rs[0] * tic[0];
+        //back_R0 被移除的帧的位姿
+        R0 = back_R0 * ric[0];   //被移除相机姿态
+        R1 = Rs[0] * ric[0];     //当前最老的相机姿态
+        P0 = back_P0 + back_R0 * tic[0];        //被移除的相机的位置
+        P1 = Ps[0] + Rs[0] * tic[0];        //当前最老的相机位置
         f_manager.removeBackShiftDepth(R0, P0, R1, P1);
     }
     else

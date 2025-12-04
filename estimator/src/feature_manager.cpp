@@ -158,13 +158,14 @@ void FeatureManager::setDepth(const VectorXd &x)
     }
 }
 
+// 移除无效点
 void FeatureManager::removeFailures()
 {
     for (auto it = feature.begin(), it_next = feature.begin();
          it != feature.end(); it = it_next)
     {
         it_next++;
-        if (it->solve_flag == 2)
+        if (it->solve_flag == 2) // 求解失败
             feature.erase(it);
     }
 }
@@ -278,28 +279,29 @@ void FeatureManager::removeBackShiftDepth(Eigen::Matrix3d marg_R, Eigen::Vector3
          it != feature.end(); it = it_next)
     {
         it_next++;
-
+        // 起始帧不是第0帧跳过，起始帧-1
         if (it->start_frame != 0)
             it->start_frame--;
         else
         {
-            Eigen::Vector3d uv_i = it->feature_per_frame[0].point;  
-            it->feature_per_frame.erase(it->feature_per_frame.begin());
-            if (it->feature_per_frame.size() < 2)
+            Eigen::Vector3d uv_i = it->feature_per_frame[0].point; // 取出归一化相机坐标系坐标
+            it->feature_per_frame.erase(it->feature_per_frame.begin());     // 移除feature_per_frame第一帧
+            if (it->feature_per_frame.size() < 2)    // 移除后只被一帧看到，移除该点
             {
                 feature.erase(it);
                 continue;
             }
             else
             {
-                Eigen::Vector3d pts_i = uv_i * it->estimated_depth;
-                Eigen::Vector3d w_pts_i = marg_R * pts_i + marg_P;
-                Eigen::Vector3d pts_j = new_R.transpose() * (w_pts_i - new_P);
+                // 转到第j帧
+                Eigen::Vector3d pts_i = uv_i * it->estimated_depth; // 相机坐标系的坐标
+                Eigen::Vector3d w_pts_i = marg_R * pts_i + marg_P; // 转到世界坐标系
+                Eigen::Vector3d pts_j = new_R.transpose() * (w_pts_i - new_P);// 转到第j帧
                 double dep_j = pts_j(2);
                 if (dep_j > 0)
                     it->estimated_depth = dep_j;
                 else
-                    it->estimated_depth = INIT_DEPTH;
+                    it->estimated_depth = INIT_DEPTH; // 无效设置乘默认值
             }
         }
         // remove tracking-lost feature after marginalize
@@ -312,6 +314,7 @@ void FeatureManager::removeBackShiftDepth(Eigen::Matrix3d marg_R, Eigen::Vector3
     }
 }
 
+// 初始化没有结束，不进行地图点新的深度的换算，还在进行视觉惯性的对齐
 void FeatureManager::removeBack()
 {
     for (auto it = feature.begin(), it_next = feature.begin();
@@ -335,18 +338,19 @@ void FeatureManager::removeFront(int frame_count)
     for (auto it = feature.begin(), it_next = feature.begin(); it != feature.end(); it = it_next)
     {
         it_next++;
-
+        // 被最后一帧看到，起始帧-1
         if (it->start_frame == frame_count)
         {
             it->start_frame--;
         }
         else
         {
-            int j = WINDOW_SIZE - 1 - it->start_frame;
-            if (it->endFrame() < frame_count - 1)
+            int j = WINDOW_SIZE - 1 - it->start_frame;  // 倒数第二帧在该地图点的KF VECTOR中的索引
+            if (it->endFrame() < frame_count - 1) // 不能被第二帧看到，continue
                 continue;
+            //观测中删掉第二帧
             it->feature_per_frame.erase(it->feature_per_frame.begin() + j);
-            if (it->feature_per_frame.size() == 0)
+            if (it->feature_per_frame.size() == 0)  // 观测为0
                 feature.erase(it);
         }
     }

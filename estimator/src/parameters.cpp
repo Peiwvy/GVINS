@@ -24,8 +24,10 @@ double ROW, COL;
 double TD;
 
 bool GNSS_ENABLE;
+// 星历话题，其中GLO卫星系统的格式不一样，因此需要单独定义
 std::string GNSS_EPHEM_TOPIC;
 std::string GNSS_GLO_EPHEM_TOPIC;
+// 卫星观测的测量话题
 std::string GNSS_MEAS_TOPIC;
 std::string GNSS_IONO_PARAMS_TOPIC;
 std::string GNSS_TP_INFO_TOPIC;

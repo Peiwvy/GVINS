@@ -33,6 +33,12 @@ FeatureTracker::FeatureTracker()
 {
 }
 
+/**
+ * @brief   对跟踪点进行排序并去除密集点
+ * @Description 对跟踪到的特征点，按照被追踪到的次数排序并依次选点
+ *              使用mask进行类似非极大抑制，半径为30，去掉密集点，使特征点分布均匀
+ * @return      void
+*/
 void FeatureTracker::setMask()
 {
     if(FISHEYE)
@@ -68,6 +74,7 @@ void FeatureTracker::setMask()
     }
 }
 
+// 把新检测到的特征点n_pts加入容器，id给-1作为区分
 void FeatureTracker::addPoints()
 {
     for (auto &p : n_pts)
@@ -78,14 +85,29 @@ void FeatureTracker::addPoints()
     }
 }
 
+/**
+ * @brief   对图像使用光流法进行特征点跟踪
+ * @Description createCLAHE() 对图像进行自适应直方图均衡化
+ *              calcOpticalFlowPyrLK() LK金字塔光流法
+ *              rejectWithF() 通过基本矩阵剔除outliers
+ *              setMask() 对跟踪点进行排序，设置mask
+ *              goodFeaturesToTrack() 添加特征点(shi-tomasi角点)，确保每帧都有足够的特征点
+ *              addPoints()添加新的追踪点
+ *              undistortedPoints() 对角点图像坐标去畸变矫正，并计算每个角点的速度
+ * @param[in]   _img 输入图像
+ * @param[in]   _cur_time 当前时间（图像时间戳）
+ * @return      void
+*/
 void FeatureTracker::readImage(const cv::Mat &_img, double _cur_time)
 {
     cv::Mat img;
     TicToc t_r;
     cur_time = _cur_time;
 
+    /*Step 1 createCLAHE() 对图像进行自适应直方图均衡化，对图像分块进行均衡化*/
     if (EQUALIZE)
     {
+        // 图像太暗或者太亮，提特征点比较难，所以均衡化一下,提升对比度，方便提角点
         cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(8, 8));
         TicToc t_c;
         clahe->apply(_img, img);
@@ -110,6 +132,7 @@ void FeatureTracker::readImage(const cv::Mat &_img, double _cur_time)
         TicToc t_o;
         vector<uchar> status;
         vector<float> err;
+        /* Step 2 calcOpticalFlowPyrLK() LK金字塔光流法跟踪*/
         cv::calcOpticalFlowPyrLK(cur_img, forw_img, cur_pts, forw_pts, status, err, cv::Size(21, 21), 3);
 
         for (int i = 0; i < int(forw_pts.size()); i++)
@@ -129,9 +152,11 @@ void FeatureTracker::readImage(const cv::Mat &_img, double _cur_time)
 
     if (PUB_THIS_FRAME)
     {
+        /* Step 3 通过对级约束来剔除outlier*/
         rejectWithF();
         ROS_DEBUG("set mask begins");
         TicToc t_m;
+        /* Step 4 保证相邻的特征点之间要相隔30个像素,设置mask*/
         setMask();
         ROS_DEBUG("set mask costs %fms", t_m.toc());
 
@@ -146,6 +171,7 @@ void FeatureTracker::readImage(const cv::Mat &_img, double _cur_time)
                 cout << "mask type wrong " << endl;
             if (mask.size() != forw_img.size())
                 cout << "wrong size " << endl;
+            /* Step 5 goodFeaturesToTrack() 添加特征点(shi-tomasi角点)，确保每帧都有足够的特征点*/
             cv::goodFeaturesToTrack(forw_img, n_pts, MAX_CNT - forw_pts.size(), 0.01, MIN_DIST, mask);
         }
         else
@@ -154,6 +180,7 @@ void FeatureTracker::readImage(const cv::Mat &_img, double _cur_time)
 
         ROS_DEBUG("add feature begins");
         TicToc t_a;
+        /* Step 6 添将新检测到的特征点n_pts添加到forw_pts中，id初始化-1,track_cnt初始化为1.*/
         addPoints();
         ROS_DEBUG("selectFeature costs: %fms", t_a.toc());
     }
@@ -162,10 +189,18 @@ void FeatureTracker::readImage(const cv::Mat &_img, double _cur_time)
     prev_un_pts = cur_un_pts;
     cur_img = forw_img;
     cur_pts = forw_pts;
+    /* Step 7 根据不同的相机模型去畸变矫正和转换到归一化坐标系上，计算速度*/
     undistortedPoints();
     prev_time = cur_time;
 }
-
+// TODO
+/**
+ * @brief   通过F矩阵去除outliers
+ * @Description 将图像坐标转换为归一化坐标
+ *              cv::findFundamentalMat()计算F矩阵
+ *              reduceVector()去除outliers
+ * @return      void
+*/
 void FeatureTracker::rejectWithF()
 {
     if (forw_pts.size() >= 8)
@@ -255,6 +290,9 @@ void FeatureTracker::showUndistortion(const string &name)
     cv::waitKey(0);
 }
 
+
+
+// 当前帧所有点统一去畸变，转换到归一化坐标系上，同时计算特征点速度，用来后续时间戳标定
 void FeatureTracker::undistortedPoints()
 {
     cur_un_pts.clear();

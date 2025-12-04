@@ -108,22 +108,25 @@ class Estimator
     vector<Vector3d> angular_velocity_buf[(WINDOW_SIZE + 1)];
 
     // GNSS related
-    bool gnss_ready;
+    bool gnss_ready;   // gnss是否初始化
     Eigen::Vector3d anc_ecef;
     Eigen::Matrix3d R_ecef_enu;
     double yaw_enu_local;
-    std::vector<ObsPtr> gnss_meas_buf[(WINDOW_SIZE+1)];
-    std::vector<EphemBasePtr> gnss_ephem_buf[(WINDOW_SIZE+1)];
-    std::vector<double> latest_gnss_iono_params;
-    std::map<uint32_t, std::vector<EphemBasePtr>> sat2ephem;
-    std::map<uint32_t, std::map<double, size_t>> sat2time_index;
+    std::vector<ObsPtr> gnss_meas_buf[(WINDOW_SIZE+1)];   // 过滤之后的观测信息
+    std::vector<EphemBasePtr> gnss_ephem_buf[(WINDOW_SIZE+1)];  // 过滤之后的星历信息
+    std::vector<double> latest_gnss_iono_params;   // 电离层参数，必须是8个数
+
+    //; 注意下面存储的键都是以卫星编号作为索引的，也就是同一个卫星的所有的观测信息，都是存在一个数组中的
+    std::map<uint32_t, std::vector<EphemBasePtr>> sat2ephem;  // 《卫星编号，<星历信息>》
+    std::map<uint32_t, std::map<double, size_t>> sat2time_index;  // 《卫星编号，<卫星时间，存储的这个卫星的所有观测的个数》
     std::map<uint32_t, uint32_t> sat_track_status;
-    double para_anc_ecef[3];
-    double para_yaw_enu_local[1];
-    double para_rcv_dt[(WINDOW_SIZE+1)*4];
-    double para_rcv_ddt[WINDOW_SIZE+1];
+
+    double para_anc_ecef[3];   // ECEF锚点的平移
+    double para_yaw_enu_local[1];  // yaw角度的偏置
+    double para_rcv_dt[(WINDOW_SIZE+1)*4]; // 接收机的时间零偏，4大卫星系统有4个不同的时间零偏
+    double para_rcv_ddt[WINDOW_SIZE+1]; // 接受机的时间零偏的变化率，只和接收机有关，因此4大卫星系统共用一个时间零偏变化率
     // GNSS statistics
-    double diff_t_gnss_local;
+    double diff_t_gnss_local;   // PPS触发时间和实际的VI传感器被触发时间之间的差值
     Eigen::Matrix3d R_enu_local;
     Eigen::Vector3d ecef_pos, enu_pos, enu_vel, enu_ypr;
 
